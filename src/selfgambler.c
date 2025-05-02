@@ -5,131 +5,170 @@
 #include <time.h>
 #include <sys/wait.h>
 #include <sys/types.h>
+#include <sys/time.h>
 
-#define MAX_GAMES 10
+volatile int hidden_number;
+volatile int try_count = 0;
+volatile pid_t guesser_id;
+volatile int min_range = 1;
+volatile int max_range;
+volatile int rounds_total = 10;
+volatile int round_current = 0;
+volatile sig_atomic_t got_guess = 0;
+volatile sig_atomic_t current_try = 0;
+volatile sig_atomic_t round_complete = 0;
 
-volatile sig_atomic_t targ;
-volatile sig_atomic_t guess;
-volatile sig_atomic_t player;
-volatile sig_atomic_t finish;
-volatile sig_atomic_t attempts;
+struct timeval begin_time, finish_time;
 
-void p1_handler(int sig, siginfo_t* info, void* context) {
-    (void)context;
-    if (sig == SIGUSR1) {
-        guess = info->si_value.sival_int;
-        if (guess == targ) {
-            kill(info->si_pid, SIGUSR1);
-            finish = 1;
+void show_time_info() {
+    gettimeofday(&finish_time, NULL);
+    long secs = finish_time.tv_sec - begin_time.tv_sec;
+    long usecs = finish_time.tv_usec - begin_time.tv_usec;
+    double total = secs + usecs * 1e-6;
+    printf("Время выполнения: %.3f секунд\n", total);
+}
+
+void correct_guess(int sig) {
+    printf("\n Игрок [%d] отгадал число %d за %d попыток\n", getpid(), hidden_number, try_count);
+    show_time_info();
+    round_complete = 1;
+    exit(0);
+}
+
+void wrong_guess(int sig) {
+    printf(" Игрок [%d]: Неверно\n", getpid());
+}
+
+void process_guess(int sig, siginfo_t *info, void *context) {
+    current_try = info->si_value.sival_int;
+    got_guess = 1;
+}
+
+void transmit_guess(int guess) {
+    union sigval value;
+    value.sival_int = guess;
+    if (sigqueue(guesser_id, SIGRTMIN, value)) {
+        perror("Ошибка передачи числа");
+        exit(1);
+    }
+}
+
+void attempt_guess() {
+    if (min_range > max_range || round_complete) {
+        return;
+    }
+
+    int guess = min_range + (max_range - min_range) / 2;
+    try_count++;
+    printf("Игрок [%d] пробует число: %d\n", getpid(), guess);
+    transmit_guess(guess);
+
+    if (guess == hidden_number) {
+        kill(guesser_id, SIGUSR1);
+        round_complete = 1;
+    } else {
+        if (guess < hidden_number) {
+            printf("Игрок [%d]: Загаданное число больше!\n", getpid());
+            min_range = guess + 1;
         } else {
-            kill(info->si_pid, SIGUSR2);
+            printf("Игрок [%d]: Загаданное число меньше!\n", getpid());
+            max_range = guess - 1;
         }
-        attempts++;
+        kill(guesser_id, SIGUSR2);
     }
 }
 
-void p2_handler(int sig, siginfo_t* info, void* context) {
-    (void)info; (void)context;
-    if (sig == SIGUSR1) {
-        finish = 1;
-    }
-}
+void guesser_role() {
+    printf("\n Игрок [%d] приступил к отгадыванию\n", getpid());
 
-void sending_guess(pid_t pid, int value) {
-    union sigval val;
-    val.sival_int = value;
-    sigqueue(pid, SIGUSR1, val);
-}
+    signal(SIGUSR1, correct_guess);
+    signal(SIGUSR2, wrong_guess);
 
-void handler_setup(void (*handler)(int, siginfo_t*, void*), int sig) {
     struct sigaction sa;
-    sa.sa_sigaction = handler;
     sa.sa_flags = SA_SIGINFO;
+    sa.sa_sigaction = process_guess;
     sigemptyset(&sa.sa_mask);
-    sigaddset(&sa.sa_mask, SIGUSR1);
-    sigaddset(&sa.sa_mask, SIGUSR2);
-    sigaction(sig, &sa, NULL);
-}
+    sigaction(SIGRTMIN, &sa, NULL);
 
-void _game(int N, int cur_player) {
-    pid_t pid = getpid();
-    pid_t ppid = cur_player ? player : getppid();
-
-    if (cur_player) {
-        targ = rand() % N + 1;
-        printf("P1 (PID %d) загадал: %d\n", pid, targ);
-
-        finish = 0;
-        attempts = 0;
-
-        kill(ppid, SIGUSR1);
-
-        while(!finish) pause();
-
-        printf("Число %d угадано за %d попыток\n", targ, attempts);
-    } else {
-        int cur_guess;
-        finish = 0;
-
-        while(!finish) {
-            cur_guess = rand() % N + 1;
-            printf("P2 (PID %d) пробует: %d\n", pid, cur_guess);
-            sending_guess(ppid, cur_guess);
-            pause();
+    while (!round_complete) {
+        pause();
+        if (got_guess) {
+            got_guess = 0;
         }
     }
+    exit(0);
 }
 
-int set_N(int arg, char* argv[]) {
-    int N = 0;
-    if (arg <= 1) {
-        printf("Введите N: ");
-        scanf("%d", &N);
-    } else {
-        N = atoi(argv[1]);
-        printf("Используется N = %d\n", N);
+void hider_role(int N) {
+    hidden_number = rand() % N + 1;
+    try_count = 0;
+    min_range = 1;
+    max_range = N;
+    round_complete = 0;
+
+    printf("\n    Раунд №%d    \n", round_current);
+    printf(" Игрок [%d] загадал число (%d)\n", getpid(), hidden_number );
+    gettimeofday(&begin_time, NULL);
+
+    signal(SIGALRM, attempt_guess);
+
+    while (!round_complete) {
+        alarm(1);
+        pause();
     }
-    return N > 0 ? N : 100;
+    show_time_info();
 }
 
-int main(int argc, char* argv[]) {
-    int N = set_N(argc, argv);
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, "Формат: %s <N>\n", argv[0]);
+        return 1;
+    }
+
+    int N = atoi(argv[1]);
+    max_range = N;
     srand(time(NULL));
 
-    sigset_t block_mask;
-    sigemptyset(&block_mask);
-    sigaddset(&block_mask, SIGUSR1);
-    sigaddset(&block_mask, SIGUSR2);
-    sigprocmask(SIG_BLOCK, &block_mask, NULL);
+    printf(" Основной процесс [%d] начал игру\n", getpid());
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        perror("fork");
-        exit(EXIT_FAILURE);
-    }
+    while (round_current < rounds_total) {
+        round_current++;
 
-    if (pid == 0) { // Дочерний процесс
-        handler_setup(p2_handler, SIGUSR1);
-        handler_setup(p2_handler, SIGUSR2);
-        sigprocmask(SIG_UNBLOCK, &block_mask, NULL);
-
-        for (int i = 0; i < MAX_GAMES; i++) {
-            _game(N, 0);
-        }
-        exit(EXIT_SUCCESS);
-    } else { // Родительский процесс
-        player = pid;
-        handler_setup(p1_handler, SIGUSR1);
-        handler_setup(p1_handler, SIGUSR2);
-        sigprocmask(SIG_UNBLOCK, &block_mask, NULL);
-
-        for (int i = 0; i < MAX_GAMES; i++) {
-            _game(N, 1);
+        // Первый игрок загадывает, второй отгадывает
+        pid_t player2 = fork();
+        if (player2 < 0) {
+            perror("Ошибка создания процесса");
+            exit(1);
         }
 
-        kill(pid, SIGTERM);
-        wait(NULL);
+        if (player2 == 0) {
+            guesser_role();
+        } else {
+            guesser_id = player2;
+            hider_role(N);
+
+            kill(player2, SIGTERM);
+            wait(NULL);
+
+            // Смена ролей
+            pid_t player1 = fork();
+            if (player1 < 0) {
+                perror("Ошибка создания процесса");
+                exit(1);
+            }
+
+            if (player1 == 0) {
+                guesser_role();
+            } else {
+                guesser_id = player1;
+                hider_role(N);
+
+                kill(player1, SIGTERM);
+                wait(NULL);
+            }
+        }
     }
 
+    printf("\n Основной процесс [%d] закончил игру. Всего раундов: %d.\n", getpid(), rounds_total);
     return 0;
 }
